@@ -1,0 +1,561 @@
+---
+title: "Capstone Project: Customer attrition for online retailer"
+author: "piRsquare"
+date: "12/17/2019"
+output: html_document
+---
+```{r CAUTION, echo =FALSE}
+# WARNING, it takes 15-20 minutes to knitr this report
+# apologies about the inconvenience
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+## Executive summary
+
+The main objective is to propose a prediction for customer attrition for a UK online retailer, using machine learning techniques. A secondary objective is to propose a linear regression to forecast next-month sales. This is proposed as secondary ojective given that it is not fully aligned with applying the machine learning techniques learned in class, although it is very relevant from a business perspective. 
+
+The original data is based on online transactions with a UK retailer, from Dec 2009 to Dec 2011. The data was published at the [UCI repository](https://archive.ics.uci.edu/ml/datasets/Online+Retail+II) by Dr. Daqing Chen (chend@lsbu.ac.uk), School of Engineering, London South Bank University. The data provides 1M records for invoice lines, for 54K invoices, 5K products, 6K customers. 
+
+For our main objective, we explore 3 different mathematical models, and 4 machine learning methods. Since we have different ways to formulate the problem predictors, we explore 3 mathematical models based on (1) monthly sales, (2) monthly activity, and (3) the Recency-Frequency-Monetary or [RFM](https://en.wikipedia.org/wiki/RFM_%28customer_value%29) formulation. We apply 4 machine learning methods, namely, (1) KNN, (2) random forests, (3) logistic regression, and (4) Naive Bayes.
+
+We randomly split 80% of the customers to train all 3X4 combinations, and to choose the best model/method. We reserve 20% of the records for testing final accuracy and as a way to verify the methods are not overfitted. The best combination is the logistic regression using the activity model with 71% accuracy during training, followed by the logistic with the RFM model. The sales model is outperformed, and hence discarded. The test set provides slightly different accuracy values, and confirms the methods are not overfitted.
+
+For our secondary objective, we compare 2 forecasting methods based on linear regression. The forecasts are calculated at the customer level using a regression fitted to estimate the prior period sales, with all customers and their data for the prior year. The data for the period to be forecasted is not used to calculate the regression coefficients, and regressions are re-calculated when we move one period forward. One regression is based on using the data from all prior 12 months, and the second regression uses only the 3 months with the highest autocorrelation (i.e. the prior month, 11 months ago, 12 months ago). 
+
+We measure the performance by comparing the actual sum of sales vs the predicted, for Jan 2011-Nov 2011. In both methods, the predictions are off early in the year, but become better in the second half. We recommend the regression with 3 variables mostly on a business practical criteria. As expected, a regression with more variables has a better numerical fit, but it tends to consistently underestimate the actual sales in the second half of the year, where the peak sales occur. 
+
+```{r preparation, echo=FALSE, include=FALSE}
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(forecast)) install.packages("forecast", repos = "http://cran.us.r-project.org")
+if(!require(gridExtra)) install.packages("gridExtra", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(forecast)
+library(readxl) # upload library to read data from excel, it is part of tidyverse package
+library(gridExtra)
+
+##############################
+# Download data from UCI
+# Note: this process could take a couple of minutes
+##############################
+
+dl <- tempfile(fileext= ".xlsx") # create temporary file with the correct extension
+download.file("https://archive.ics.uci.edu/ml/machine-learning-databases/00502/online_retail_II.xlsx", dl, mode = "wb") #use mode wb
+
+# read sheets 1 and 2 from data file in excel
+dat1 <- read_xlsx(dl, sheet = 1)
+dat2 <- read_xlsx(dl, sheet = 2)
+
+# consolidate data from both sheet in a single file, and after that remove single-sheet files and teporary file dl
+data <-rbind(dat1,dat2)
+rm(dat1,dat2,dl)
+
+```
+## Methods and Analysis
+
+### Preliminary counts
+
+
+```{r count, echo=FALSE}
+# Count invoices, products and customers
+table1 <- data %>%  summarize(Number_records= n(),
+                              Number_invoices = n_distinct(Invoice), 
+                              Number_products = n_distinct(StockCode), 
+                              Number_customers = n_distinct(`Customer ID`))
+table1
+```
+
+### Missing values
+The data has 8 variables, and we start by finding if there are any missing data (NA) in the 5 variables we will need in the analysis; we exclude StcokCode, Description and Country which will not be used. We can see that we are missing a large number of Customer IDs, about 25% of the records. We cannot delete that many records, and later on we will show they represent an important part of the sales. Hence, we will treat them as if they were transactions with one generic anonymous customer identified with NA.   
+
+
+```{r NAs, echo=FALSE}
+# check for NAs
+data %>%  select(Invoice, InvoiceDate, Quantity, Price, `Customer ID`) %>% 
+        summarize(Invoice_NA = sum(is.na(Invoice)), 
+                  InvoiceDate_NA = sum(is.na(InvoiceDate)), 
+                  Quantity_NA = sum(is.na(Quantity)), 
+                  Price_NA =sum(is.na(Price)),
+                  CustomerID_NA = sum(is.na(`Customer ID`)))
+```
+
+### Outliers for Price and Quantity
+We will use Price and Quantity to calculate Sales value, hence we need to understand if outliers are data errors that need to be addressed. The table below shows the outliers for Quantity (i.e. 3 highest and 3 most negative). #1 seems a legitimate purchase; #3-4 and #7-8 are a order and its matching cancellation, with 0 net sales impact; the remaining #2, 5, 6 have Price = 0, we suspect they are inventory losses, with no impact on sales.
+```{r outlier1, echo=FALSE}
+# create table with largest 3 quantity outliers, and largest 3 price outliers
+rbind(top_n(data, 3, Quantity),top_n(data, -3, Quantity)) %>% arrange(InvoiceDate) %>% select(-Description,-Country)
+```
+
+The next table repeats the outlier analysis using the Price variable. StockCode = B corresponds to adjustments for bad debt; StockCode = M are manual corrections. All normal part of business, hence we accept them.
+
+```{r outlier2, echo=FALSE}
+rbind(top_n(data, 3, Price),top_n(data, -3, Price)) %>% arrange(InvoiceDate) %>% select(-Country, -Description)
+```
+
+### Available dates
+
+We calculate the number of days with active sale per month, as a way to detect if we have incomplete months. Clearly, we have one month with incomplete data, Dec 2011, that we will have to exclude from the analysis. In 2009 and 2010, December has less active days because of the post-Christmas break.
+ 
+```{r calendar, echo=FALSE}
+# count days per month and plot them
+calendar <- data %>% 
+    mutate(month=floor_date(InvoiceDate,"month"), day=floor_date(InvoiceDate,"day")) %>% 
+    group_by(month) %>% 
+    summarize(active_days=n_distinct(day))
+# plot(calendar, type = "b", main = "Count of active days per month")
+calendar %>% ggplot(aes(month, active_days)) + geom_point() + geom_line() + 
+              ggtitle("Count of active days per month") +
+              geom_text(aes(x = month[1], y = active_days[1]-1, label = "Dec 2009")) + 
+              geom_text(aes(x = month[13], y = active_days[13]-1, label = "Dec 2010")) +
+              geom_text(aes(x = month[25], y = active_days[25]+1, label = "Dec 2011"))
+```
+
+We also noticed that the company seems to take Saturdays off, and that explains why we do not see months with 30 or 31 active days.
+```{r week_calendar, echo=FALSE}
+# count activity by day of the week and plot it
+calendar <- data %>% 
+  mutate(day=floor_date(InvoiceDate,"day")) %>% 
+  distinct(day) %>%  mutate( week_day = wday(day, label = TRUE)) %>% group_by(week_day) %>% summarize(active_days = n())
+# barplot(table(calendar$week_day), ylab = "Days", main = "Count ot active days per day of the week")
+calendar %>% ggplot(aes(week_day,active_days))+ geom_bar(stat= "identity") + ggtitle("Count ot active days per day of the week")
+```
+
+### Sales seasonality
+
+Sales have a strong seasonality, with a peak in the last quarter of the year. There seems to be a mild annual increase too. The seasonality implies the need to use models with a time horizon of 12 months.
+```{r seasonality, echo=FALSE, include=FALSE}
+# explore sales seasonality
+data_month <- data %>% 
+          mutate(month = floor_date(InvoiceDate,"month")) %>%  
+          group_by(month) %>% 
+          summarize(Sales = sum(Price*Quantity))
+ chart <- data_month %>% ggplot(aes(month, Sales)) +
+                geom_point(size = 3, alpha = .6, color = "grey") + geom_line() + ggtitle("Sales by month") +
+                geom_smooth(color="red", span=0.4, method = "loess", se= FALSE) + 
+                geom_text(aes(x= month[3], y= Sales[1]+10000), label = "Short term trend", color="red") +
+                geom_smooth(color="blue", span=2, method = "loess", se= FALSE) +
+                geom_text(aes(x= month[13], y= Sales[1]+10000), label = "Annual trend", color="blue")
+```
+
+```{r chart, echo=FALSE}
+chart
+```
+
+We also calculated the autocorrelation of sales. Given the annual seasonality, it is no surprise to see a higher correlation with lags of 11 and 12 months. There is also some correlation with the prior month. This observation justifies to explore a forecasting model based on those 3 periods.
+```{r autocorrelation, echo=FALSE, include=FALSE}
+# plot autocorrelations
+chartac <-ggAcf(ts(data_month$Sales), main= "Autocorrelation by month")
+```
+
+```{r chart3, echo=FALSE}
+chartac
+```
+
+### Pareto distribution of customer sales
+
+A histogram of customer sales indicates there are a few large customers, and many small ones. In business, we usually hear that _20% of the customers represent 80% of the sales_, and we will show that that applies to oru UK online retailer too.  
+```{r customer, echo=FALSE, include=FALSE}
+# explore customers
+
+# calculate sales by customer ID, and sort decreasingly
+customers <- data %>% group_by(`Customer ID`) %>%  summarize( LineItems=n(), Qty = sum(Quantity), Sales = sum(Price*Quantity)) %>% arrange(desc(Sales))
+# calculate median and max customer sales
+sales_median <- median(customers$Sales)
+sales_max <- max(customers$Sales)
+
+# make sales histogram 
+customers %>% ggplot(aes(Sales))+geom_histogram(binwidth=0.2, color="black") +
+              scale_x_continuous(trans ="log10", breaks = 10^seq(0,7)) + 
+              ggtitle("Customer Sales Histogram using log scale") +
+              ylab("Customer count") +
+              geom_text(aes(x=10000, y=800), label=paste0("  Median = ", sales_median, " sterling pounds")) +
+              geom_text(aes(x=500000, y=100), label=paste0("Largest customer = ", round(sales_max/1000000,1), " million sterling pounds"))
+```
+
+We can see that our top 5 customers are led by the group identified with NA, which is all customers missing ID.
+```{r top5}
+top_n(customers,5)
+```
+We can also see that sales to customers with missing ID are important and happen every month, making a case for keeping those records as part of the analysis.
+
+```{r NA_sales, echo=FALSE}
+# prepare data to explore impact of customers without ID, by month
+data_graph <- data %>% 
+        mutate(month = floor_date(InvoiceDate,"month"), CustomerGroup = ifelse(is.na(`Customer ID`),"No_ID","Has_ID")) %>% 
+        group_by(month, CustomerGroup) %>% 
+        summarize(Sales = sum(Price*Quantity))
+# make histogram by month, splitting customers without ID from customers with ID        
+data_graph %>%  ggplot(aes(month,Sales, fill=CustomerGroup))+geom_bar(stat="identity") + ggtitle("Sales by month by customer group")
+```
+
+We close our exploratory analysis with the Sales Pareto chart. When we sort the customers by sales, we confirm that the cumulative sales of the 20% larger customers represent 80% of the total.
+```{r Pareto, echo=FALSE}
+# prepare data set to create Pareto chart of customer sales
+# customers are sorted decreasing by sales
+# estimate how many customers are needed to achieve 80% of the total sales
+TotSales  <- sum(customers$Sales)
+
+sales_pareto <- data.frame(c=seq(6.5,0,-0.1)) # select points to plot in the x-axis, using log scale
+sales_pareto <- sales_pareto %>% group_by(c) %>% 
+          mutate(
+                  sales_cut = 10^c, # find cut in sterling pouns, by transforming from log scale
+                  cust_perc = mean(customers$Sales >= sales_cut), # percentage of customers above the cut
+                  cust_count = sum(customers$Sales >= sales_cut), # count of customers above the cut
+                  sales_cum = sum(customers$Sales*(customers$Sales >= sales_cut))/TotSales # cumulative sales asa percentage
+                  )
+# calculate number of customers for which cumulative sales are 80%, i.e. the Pareto point
+index  <- first(which(sales_pareto$sales_cum >=0.8))
+pareto_point <- ((0.8-sales_pareto$sales_cum[index-1])*sales_pareto$cust_count[index] + (sales_pareto$sales_cum[index]-0.8)*sales_pareto$cust_count[index-1])/(sales_pareto$sales_cum[index]-sales_pareto$sales_cum[index-1])
+
+# plot Pareto chart using the data set prepared
+sales_pareto %>% ggplot(aes(cust_count,sales_cum)) +
+                geom_line() +
+                geom_segment(x = 0, y = 0.8, xend = pareto_point, yend = 0.8, color = "black", lty = 2) +
+                geom_segment(x = pareto_point, y = 0, xend = pareto_point, yend = 0.8, color = "black", lty = 2) +
+                ggtitle("Pareto Sales") + ylab("Percentage of total sales") + xlab("Customer count") +
+                geom_text(aes(x = 1.25*pareto_point, y = 0.9, label = paste0("Pareto: 80% of sales with ",round(pareto_point)," customers;  ", round(100*pareto_point/max(cust_count),1)," % of customers")))
+```
+
+### Prediction of customer attrition
+
+The main objective is to predict customer attrition:
+
+* Define a customer to be attrited if 2011 Sales are zero or negative
+* Use 2010 data to build three formulation *models*
+    1. Sales, with 12 predictors defined as monthy sales in Jan-Dec
+    2. Activity, with 12 predictors defined as 1 if Sales >-, 0 otherwise
+    3. RFM, with 3 predictors
+    + Recency = number of months between the last 2010 activity and Jan 2011, i.e, 1 if last positive sale was Dec 2010
+    + Frequency = number of 2010 months with activity
+    + Monetary = 2010 sales
+* Split customers randomly into training and test sets, with 80% and 20% of 2010 customers, respectively
+* Apply four machine learning *methods*
+  1. KNN or K-Nearest Neighbors (cross-validated)
+  2. Random forests (cross-validated)
+  3. Logistic regression
+  4. Naive Bayes
+* Use training data to calculate method parameters and to evaluate prediction accuracy for the 12 model/method combinations
+* Select model/method combination with highest accuracy
+* Evaluate prediction accuracy in the test set, to check for overfitting
+
+We provide an example in order to compare the 3 models
+
+Model | Predictors | Jan | Feb | Mar | Apr | May | Jun | Jul | Aug | Sep | Oct | Nov | Dec | Recency | Freq | Monetary
+------------------|------------|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|---------|------|---------
+Sales|12|0|100|0|0|150|-50|0|0|200|0|0|0|||
+Activity|12|0|1|0|0|1|0|0|0|1|0|0|0|||
+RFM|3|||||||||||||4|3|400
+
+The highest accuracy is for the validation model with the logistic method, with RFM/logistic a close second. Detailed results will be discussed in the next section.
+
+```{r models, echo=FALSE}
+#############################################
+# Customer attrition model
+# define customer attrited = no sales in 2011
+# build prediction model using 2010 customer sales purchase patterns
+# explore 3 mathematical formulations for sales patterns
+#############################################
+
+# identify customers with 2011 sales >0
+act2011 <- data %>% filter(year(InvoiceDate)==2011) %>% group_by(`Customer ID`) %>% summarize(active2011 = ifelse(sum(Price*Quantity)>0,"1","0"))
+
+# prepare 2010 data set
+# Sales = total sales by customer by month
+# activity = 1 if sales >0, 0 otherwise, by customer by month
+# active2011 =1 if active in 2011, 0 if not active
+data2010 <- data %>% 
+              filter(year(InvoiceDate)==2010) %>% 
+              group_by(`Customer ID`,month=month(InvoiceDate)) %>% 
+              summarize(sales=sum(Price*Quantity),activity= ifelse(sales>0,1,0))
+# for 2010 customers define 
+data2010 <- data2010 %>% left_join(act2011, by= "Customer ID") %>% mutate(active2011=ifelse(is.na(active2011),"0",active2011))
+
+# first mathematical formulation, matrix with value = sales, months as columns
+sales_matrix <- data2010 %>% select(-activity) %>% spread(month,sales, fill=0)
+
+# second mathematical formulation, binary matrix with value = activity, months as columns
+activity_matrix <- data2010 %>% select(-sales) %>% spread(month,activity, fill=0)
+
+# third mathematical formulation usign RFM, recency-frequency-monetary
+# recency = months to the last time with sales, 1 if sales in Dec 2010, 12 in last sales in Jan 2010, by customer
+# freq = count of months with activity in 2010, by customer
+# monetary = total 2010 sales, by customer
+rfm_matrix <- data2010 %>% group_by(`Customer ID`) %>% summarize(active2011 = max(active2011), recency = 13-max(month), freq = sum(activity), monetary = sum(sales))
+
+# partition into train and test sets, for the 3 mathematical models, sales, activity, rfm
+set.seed(1984) # set orwellian seed
+test_index <- createDataPartition( y= sales_matrix$active2011, times = 1, p = 0.2, list = FALSE)
+test_sales <- sales_matrix[test_index,]
+test_activity <- activity_matrix[test_index,]
+test_rfm <- rfm_matrix[test_index,]
+train_sales <- sales_matrix[-test_index,]
+train_activity <- activity_matrix[-test_index,]
+train_rfm <- rfm_matrix[-test_index,]
+```
+
+### Prediction of next-month sales
+ A secondary objective was to explore linear regression to forecast next-month sales, i.e. to forecast 1-period ahead using past data. This constraint prevents from using the smootthing techniques learned in class, since they smooth a period using past and future periods.
+ 
+ * We use sales data by customer, by month
+ * Predictions are calculated by customer, and aggregated to find monthly sales
+ * Each month, a regression is trained to predict the current month using the prior 12 months, e.g. month 0 as a function of months -1, ... , -12
+ * The periods are shifted one month, and the regression used to predict the next month, e.g. month 1 predicted using the regression for month 0 with the data for months 0, -1, ... , -11
+ * Use two regressions, one based on all prior 12 months, a second based on the months -1, -11, -12 which have highest autocorrelation
+ * Calculate predictions for Jan-Nov 2011, to compare the models. Dec 2011 is a partial month data and cannot be used.
+ 
+ The approach departs from traditional machine learnign in that we do not split the data set randmly into a training and test set. Instead, we take advantage of the additional structure provided by the time variable. But we respect the principle that a model cannot be trained using the data it needs to predict. Results are discussed in the net section.
+ 
+## Results for Attrition Prediction
+
+The following charts show the results of using cross-validation to select the best parameters for KNN and random forest.
+
+* For KNN, we need to find the best k, we can see the activiy model prefers a smaller k, while the other 2 models prefer a larger k
+* For random forest, all the best for all models is to use 2 random predictors
+
+### Cross-Validations KNN method
+
+```{r knn, echo=FALSE}
+options(digits = 3) # print accuracy resuts with 3 digits
+
+# prepare matrices to store accuracy results for train and test sets
+train_results <- matrix(0, nrow = 3, ncol = 4)
+colnames(train_results)<-c("knn","rf", "logistics", "naive_bayes")
+rownames(train_results) <-c("sales", "activity","rfm")
+test_results <- train_results
+
+
+# sales model, knn method
+set.seed(1492)
+train_knn_sales <- train(active2011 ~ ., method = "knn", 
+                   data = train_sales[,2:14],
+                   tuneGrid = data.frame(k = seq(3, 60, 2)))
+p1 <- ggplot(train_knn_sales, highlight = TRUE) + ggtitle( "Cross-validation Sales model, knn method")
+train_results["sales","knn"] <- max(train_knn_sales$results[["Accuracy"]])
+test_results ["sales","knn"] <- mean(predict(train_knn_sales, test_sales[,2:14]) == test_sales$active2011)
+
+# activity model, knn method
+set.seed(1492)
+train_knn_activity <- train(active2011 ~ ., method = "knn", 
+                         data = train_activity[,2:14],
+                         tuneGrid = data.frame(k = seq(3, 30, 2)))
+p2 <- ggplot(train_knn_activity, highlight = TRUE) + ggtitle( "Cross-validation Activity model, knn method")
+train_results["activity","knn"] <- max(train_knn_activity$results[["Accuracy"]])
+test_results ["activity","knn"] <- mean(predict(train_knn_activity, test_activity[,2:14]) == test_activity$active2011)
+
+# rfm model, knn method
+set.seed(1492)
+train_knn_rfm <- train(active2011 ~ ., method = "knn", 
+                            data = train_rfm[,2:5],
+                            tuneGrid = data.frame(k = seq(3, 60, 2)))
+p3 <- ggplot(train_knn_rfm, highlight = TRUE) + ggtitle( "Cross-validation RFM model, knn method")
+train_results["rfm","knn"] <- max(train_knn_rfm$results[["Accuracy"]])
+test_results ["rfm","knn"] <- mean(predict(train_knn_rfm, test_rfm[,2:5]) == test_rfm$active2011)
+
+grid.arrange(p1, p2, p3, ncol=3) # plot knn trio of cross validation charts
+```
+
+### Cross-validation Random Forest method
+
+```{r rf, echo=FALSE, include=FALSE}
+# sales model, random forest method
+set.seed(1492)
+train_rf_sales <- train(active2011 ~ ., method = "rf", 
+                         data = train_sales[,2:14])
+p4 <- ggplot(train_rf_sales, highlight = TRUE) + ggtitle( "Cross-validation Sales model, random forest method")
+train_results["sales","rf"] <- max(train_rf_sales$results[["Accuracy"]])
+test_results ["sales","rf"] <- mean(predict(train_rf_sales, test_sales[,2:14]) == test_sales$active2011)
+
+# activity model, random forest method
+set.seed(1492)
+train_rf_activity <- train(active2011 ~ ., method = "rf", 
+                            data = train_activity[,2:14])
+p5 <- ggplot(train_rf_activity, highlight = TRUE) + ggtitle( "Cross-validation Activity model, random forest method")
+train_results["activity","rf"] <- max(train_rf_activity$results[["Accuracy"]])
+test_results ["activity","rf"] <- mean(predict(train_rf_activity, test_activity[,2:14]) == test_activity$active2011)
+
+# rfm model, random forest method
+set.seed(1492)
+train_rf_rfm <- train(active2011 ~ ., method = "rf", 
+                       data = train_rfm[,2:5])
+p6 <- ggplot(train_rf_rfm, highlight = TRUE) + ggtitle( "Cross-validation RFM model, random forest method")
+train_results["rfm","rf"] <- max(train_rf_rfm$results[["Accuracy"]])
+test_results ["rfm","rf"] <- mean(predict(train_rf_rfm, test_rfm[,2:5]) == test_rfm$active2011)
+```
+
+```{r grid, echo=FALSE}
+grid.arrange(p4, p5, p6, ncol = 3)
+```
+
+```{r others, echo=FALSE, include=FALSE}
+
+# sales model, logistics method
+train_glm_sales <- train(active2011 ~ ., method = "glm", 
+                        data = train_sales[,2:14])
+train_results["sales","logistics"] <- max(train_glm_sales$results[["Accuracy"]])
+test_results ["sales","logistics"] <- mean(predict(train_glm_sales, test_sales[,2:14]) == test_sales$active2011)
+
+# activity model, logistics method
+train_glm_activity <- train(active2011 ~ ., method = "glm", 
+                           data = train_activity[,2:14])
+train_results["activity","logistics"] <- max(train_glm_activity$results[["Accuracy"]])
+test_results ["activity","logistics"] <- mean(predict(train_glm_activity, test_activity[,2:14]) == test_activity$active2011)
+
+# rfm model, logistics method
+train_glm_rfm <- train(active2011 ~ ., method = "glm", 
+                      data = train_rfm[,2:5])
+train_results["rfm","logistics"] <- max(train_glm_rfm$results[["Accuracy"]])
+test_results ["rfm","logistics"] <- mean(predict(train_glm_rfm, test_rfm[,2:5]) == test_rfm$active2011)
+
+# sales model, naive bayes method
+train_nb_sales <- train(active2011 ~ ., method = "naive_bayes", 
+                         data = train_sales[,2:14])
+train_results["sales","naive_bayes"] <- max(train_nb_sales$results[["Accuracy"]])
+test_results ["sales","naive_bayes"] <- mean(predict(train_nb_sales, test_sales[,2:14]) == test_sales$active2011)
+
+# activity model, naive bayes method
+train_nb_activity <- train(active2011 ~ ., method = "naive_bayes", 
+                            data = train_activity[,2:14])
+train_results["activity","naive_bayes"] <- max(train_nb_activity$results[["Accuracy"]])
+test_results ["activity","naive_bayes"] <- mean(predict(train_nb_activity, test_activity[,2:14]) == test_activity$active2011)
+
+# rfm model, naive bayes method
+train_nb_rfm <- train(active2011 ~ ., method = "naive_bayes", 
+                       data = train_rfm[,2:5])
+train_results["rfm","naive_bayes"] <- max(train_nb_rfm$results[["Accuracy"]])
+test_results ["rfm","naive_bayes"] <- mean(predict(train_nb_rfm, test_rfm[,2:5]) == test_rfm$active2011)
+
+```
+
+### Final Results for Attrition Prediction
+
+For each of the 3 models, we have accuracy results of 4 learning machine methods. A simple average by model seems to indicate the Sales model is the weakest.
+
+```{r results1, echo=FALSE}
+rowMeans(train_results) # compare results by model
+```
+
+The table above is only an indication, but more detailed results confirm the relative weakness of the sales model. The charts below provide more details. 
+
+* The best model is chosen using the training data on the left chart, and it is the logistic with the activity model with accuracy 71.3%
+* The second best model is the logistic with the RFM model with accuracy 70.8%
+* The accuracy on the test set confirms there is no overfitting. Note that kkn and rf have the same test accuracy for activity, the dots overlap and only one shows.
+
+```{r results2, echo=FALSE}
+# make chart to compare methods
+chart <- gather(data.frame(train_results), key = "method", value = "accuracy") # transform data from matrix to tidy
+chart <- data.frame(model = c("sales", "activity","rfm"), chart) # add model names
+chart1 <- data.frame(data = "train", chart) # add name of data set
+chart <- gather(data.frame(test_results), key = "method", value = "accuracy") # transform data from matrix to tidy
+chart <- data.frame(model = c("sales", "activity","rfm"), chart) # add model name
+chart2 <- data.frame(data = "test", chart) # add name of data set
+chart_all <- rbind(chart1,chart2) # put train and test resukts in one set with tidy format
+
+chart_all %>% ggplot(aes(model,accuracy, color = method )) + geom_point(size = 5) +
+  ggtitle("Accuracy by model, method as a color") + facet_grid(.~ data)
+```
+ 
+### Final Results for Next-Month Sales Forecast
+ 
+ The next-month forecast was our secondary objective. We understand it is not fully aligned with the materials studied, but we think it has business relevance. The charts show the results of comparing prediction with actuals for 2011. As explained before, we compare a regression with 12 months vs a regression with 3 months. Graphically we can see that:
+ 
+ * Both Forecasts can be off by more than 20% in some months
+ * Forecasts improve in the second half of the year, which is good news because it is when the sales peak
+ * The regression with 12 months have bias to underperform in the second half of the year
+ 
+ Based on those observations, we recommend to use the forecast with 3 months, with the caveat that we should continue searching for a more accurate approach. 
+
+```{r salesfcst, echo=FALSE}
+###############################################################
+# run one-month ahead prediction models using linear regression
+###############################################################
+
+# set up matix with customers as rows, months as columns, Sales as value
+mod_matrix <- data %>% 
+  mutate(month = floor_date(InvoiceDate,"month")) %>% 
+  group_by(month, `Customer ID`) %>% 
+  summarize(Sales = sum(Price*Quantity)) %>% 
+  spread(month, Sales, fill=0)  # use fill=0 to assing 0 instead of NA to a month when a customer has no sales
+
+# define vector of names to label variables
+names <- c(paste0("x",1:12),"y")
+
+# because of sales seasonality, we use 12 months to train a model that predicts month 13th. 
+# the model is applied on the data from the 2nd to the 13th month to predict the upcoming month, month 14th
+# the process is repeated, shifting one month ahead
+# Dec 2011 is not predicted, data is a partial month
+
+n <- seq(2,12,1) 
+
+####################################################
+#the first model uses all 12 prior months to predict
+####################################################
+
+predictions <- sapply(n,function(n){
+  mod <-mod_matrix[,n:(n+12)] %>% filter(rowSums(.)>0)  # take 13 columns from mod_matrix, keep rows for customers with actual sales in those 13 months
+  names(mod) <- names # rename the 13 columns as x1, ..., x12, y
+  fit_lm <- lm(formula = y ~ ., data = mod) # train linear regression model to predict y usig all 12 prior months
+  mod <- mod_matrix[,(n+1):(n+13)] %>% filter(rowSums(.)>0) # build test set by shifting one column to the right, keep rows for customers with actual sales
+  names(mod) <- names # rename the 13 columns for the new data set
+  return(c(sum(mod$y),sum(predict(fit_lm,mod)))) # calculate actual sales and predicted sales
+})
+
+# create plots, assess rmse of predictions
+
+# hist(predictions[2,]/predictions[1,], breaks=seq(0,3,0.4), xlab="Prediction/Actual", main = "Histogram of prediction/actual - 12 predictors", col="gray")
+period <- as_date(names(mod_matrix)[15:25])
+chart_data <- data.frame(period,actual =predictions[1,], prediction = predictions[2,])
+p7 <- chart_data %>% ggplot(aes(period, prediction/actual)) +geom_line() +geom_point()+
+  geom_hline(yintercept=1, col = "red") +geom_hline(yintercept=1.2, linetype =2, col="red") +geom_hline(yintercept=0.8, linetype =2, col="red") +
+  ggtitle("2018 Predictions using 12 predictors") + 
+  geom_text(aes(x = chart_data$period[7], y = 1.25), label = paste0("RMSE = ",round(RMSE(chart_data$actual,chart_data$prediction)), " per month"))
+
+####################################################################
+#the second model uses the 3 months that have highest autocorrelation
+# 1, 11 and 12 months prior to the month to be predicted
+####################################################################
+
+predictions <- sapply(n,function(n){
+  mod <-mod_matrix[,n:(n+12)] %>% filter(rowSums(.)>0)  # take 13 columns from mod_matrix, keep rows for customers with actual sales in those 13 months
+  names(mod) <- names # rename the 13 columns as x1, ..., x12, y
+  fit_lm <- lm(formula = y ~ x1 + x2 + x12, data = mod) # train linear regression model to predict y using x1 (a year ago), x2 (11 months), x12 (prior month)
+  mod <- mod_matrix[,(n+1):(n+13)] %>% filter(rowSums(.)>0) # build test set by shifting one column to the right, keep rows for customers with actual sales
+  names(mod) <- names # rename the 13 columns for the new data set
+  return(c(sum(mod$y),sum(predict(fit_lm,mod)))) # calculate actual sales and predicted sales
+})
+
+# create plots, assess rmse of predictions
+
+# hist(predictions[2,]/predictions[1,], breaks=seq(0,3,0.4), xlab="Prediction/Actual", main = "Histogram of prediction/actual - 3 predictors", col="gray")
+period <- as_date(names(mod_matrix)[15:25])
+chart_data <- data.frame(period,actual =predictions[1,], prediction = predictions[2,])
+p8 <- chart_data %>% ggplot(aes(period, prediction/actual)) +geom_line() +geom_point()+
+  geom_hline(yintercept=1, col = "red") +geom_hline(yintercept=1.2, linetype =2, col="red") +geom_hline(yintercept=0.8, linetype =2, col="red") +
+  ggtitle("2018 Predictions using 3 predictors") + 
+  geom_text(aes(x = chart_data$period[7], y = 1.25), label = paste0("RMSE = ",round(RMSE(chart_data$actual,chart_data$prediction)), " per month"))
+
+grid.arrange(p7, p8, ncol =2)
+```
+
+## Conclusions
+
+We covered two objectives, to define a prediction model for customer attrition using machine learning, and to explore a next-month forecast for sales, for a UK online retailer.
+
+The main learning from this project was about data  and Rmd wrangling. The majority of time and effort was in finding the right command or option to make the code work. Looking for answers in the help files, online tutorials, and comments from the global community was a great way to expand my knowledge of R and R markdown. 
+
+The second learning is that it is important to pick the right formulation for the variables in your problem. In this case, transforming the Sales variable into an Activity variable helped improve the attrition prediction accuracy. Please note that attrition is a binary variable, so is activity. That might explain why sales, a continuous variable, underperforms. RFM also does well to predict attrition, it is a mixed model with 2 binary variables and one continuous (monetary).
+
+The third learning is that there is too much to learn whether there is a conection between a data and its structure that could help identify the best machine learning technique to use. There is an exhuberancy of machine learning algorithms, and the approach is to try many to see which one fits best. Is there a better way?
+
+In terms of potential future enhancements, the attrition model could be improved if there was a way to clean up the missing customer IDs. It also would be interestiting to look for data beyond 2011 to validate and test.
+
+The next-month sales forecast might be improved with additional years of data. Seasonality could be made explicit with a multiplicatitive model, but more years of data are needed for a robust calculation. 
